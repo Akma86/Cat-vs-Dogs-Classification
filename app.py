@@ -7,11 +7,15 @@ import streamlit as st
 # Optional backends
 _TORCH_AVAILABLE = False
 _TF_AVAILABLE = False
+_ONNX_AVAILABLE = False
 try:
     import torch; _TORCH_AVAILABLE = True
 except: pass
 try:
     import tensorflow as tf; _TF_AVAILABLE = True
+except: pass
+try:
+    import onnxruntime as ort; _ONNX_AVAILABLE = True
 except: pass
 
 # ---------------------------- CONFIG / STYLE ----------------------------
@@ -45,7 +49,7 @@ footer {visibility: hidden;}
 st.markdown("""
 <div class="hero">
     <h1>🐱🐶 Cat vs Dog Classifier</h1>
-    <p>Real-time webcam & image upload powered by Deep Learning</p>
+    <p>Supports TensorFlow, PyTorch & ONNX Runtime 🚀</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -54,9 +58,10 @@ st.sidebar.image(
     "https://cdn-icons-png.flaticon.com/512/616/616408.png", width=100
 )
 st.sidebar.header("⚙️ Settings")
-model_path = "cnn_traditional.h5"
+model_path = st.sidebar.text_input("Model path", value="cnn_traditional.h5")
 use_gpu = st.sidebar.checkbox("Use GPU if available (PyTorch)", value=True)
 img_size = st.sidebar.slider("Input size", 64, 512, 224, step=16)
+use_quant = st.sidebar.checkbox("Enable quantization (ONNX)", value=False)
 st.sidebar.markdown("---")
 class0 = st.sidebar.text_input("Class 0 label", value="Cat")
 class1 = st.sidebar.text_input("Class 1 label", value="Dog")
@@ -64,20 +69,42 @@ labels = [class0, class1]
 
 # ---------------------------- Model Loader ----------------------------
 @st.cache_resource
-def load_any_model(path: str, prefer_gpu: bool = True):
+def load_any_model(path: str, prefer_gpu: bool = True, quant: bool = False):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Model file not found: {path}")
     ext = os.path.splitext(path)[1].lower()
-    if ext in [".pt", ".pth"]:
+
+    if ext in [".onnx"]:
+        if not _ONNX_AVAILABLE: raise RuntimeError("ONNX Runtime not available")
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if prefer_gpu else ["CPUExecutionProvider"]
+        sess_options = ort.SessionOptions()
+
+        if quant:
+            # quantization ONNX
+            try:
+                from onnxruntime.quantization import quantize_dynamic, QuantType
+                q_model = "quantized_model.onnx"
+                quantize_dynamic(path, q_model, weight_type=QuantType.QInt8)
+                path = q_model
+                print("✅ Quantized ONNX model created")
+            except Exception as e:
+                print("⚠️ Quantization failed:", e)
+
+        session = ort.InferenceSession(path, sess_options, providers=providers)
+        return "onnx", session, None
+
+    elif ext in [".pt", ".pth"]:
         if not _TORCH_AVAILABLE: raise RuntimeError("PyTorch not available")
         device = torch.device("cuda" if (prefer_gpu and torch.cuda.is_available()) else "cpu")
         model = torch.load(path, map_location=device)
         model.to(device).eval()
         return "torch", model, device
+
     elif ext in [".h5", ".keras"]:
         if not _TF_AVAILABLE: raise RuntimeError("TensorFlow not available")
         model = tf.keras.models.load_model(path, compile=False)
         return "tf", model, None
+
     else:
         raise ValueError("Unsupported model extension")
 
@@ -109,7 +136,7 @@ def postprocess_logits(logits, backend: str):
 backend, model, device = None, None, None
 try:
     with st.spinner("Loading model..."):
-        backend, model, device = load_any_model(model_path, prefer_gpu=use_gpu)
+        backend, model, device = load_any_model(model_path, prefer_gpu=use_gpu, quant=use_quant)
     st.success(f"Model loaded ({backend.upper()})")
 except Exception as e:
     st.error(f"Failed to load model: {e}")
@@ -119,12 +146,20 @@ def infer_image(pil_img: Image.Image):
     if backend is None or model is None: return
     x = preprocess_pil(pil_img, img_size)
     t0=time.time()
+
     if backend=="torch":
         out=model(torch.tensor(x).permute(0,3,1,2).to(device).float())
         logits=out.detach().cpu().numpy()
-    else:
+
+    elif backend=="tf":
         out=model(x, training=False)
         logits = out.numpy() if hasattr(out,"numpy") else np.array(out)
+
+    elif backend=="onnx":
+        inp = {model.get_inputs()[0].name: x.astype(np.float32)}
+        out = model.run(None, inp)
+        logits = np.array(out[0])
+
     dt=(time.time()-t0)*1000
     probs, idx = postprocess_logits(logits, backend)
     pred_label, pred_prob = labels[int(idx[0])], float(probs[0,int(idx[0])])
